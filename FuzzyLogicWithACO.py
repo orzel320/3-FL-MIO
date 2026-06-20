@@ -5,17 +5,48 @@ import pandas as pd
 import skfuzzy as fuzz
 from skfuzzy import control as ctrl
 import itertools
+import os
+from typing import List
 
 from sklearn.metrics import r2_score, mean_absolute_error
 import matplotlib.pyplot as plt
 
-def antColonyOptimization(trainX, trainY, baseSystem):
-    # Miejsce na implementację algorytmu mrówkowego.
-    # Wczytaj początkowe parametry przy użyciu getUniqueVariables.
-    # Optymalizuj tablice [a, b, c] i nadpisuj używając applyParametersToSystem.
-    # TODO: Wersja dyskretna czy ciągła?
+def swarmColonyOptimization(trainX, trainY, baseSystem, tryToFindBetterSolution=False):
+    from SwarmAlgorithm import swarm_algorithm
+    optimizedSystem = Fuzzy.ControlSystem(baseSystem.rules) 
 
-    optimizedSystem = baseSystem
+    if not tryToFindBetterSolution and os.path.exists("best_solution.txt"):
+        with open("best_solution.txt", "r") as f:
+            print("LOADING BEST SOLUTION FROM FILE")
+            best_params = list(map(float, f.read().strip().split(",")))
+            applyParametersToSystem(optimizedSystem, best_params)
+            return optimizedSystem
+            
+    params_from_cached_filpe : List[float] | None = None
+    if tryToFindBetterSolution and os.path.exists("best_solution.txt"):
+        with open("best_solution.txt", "r") as f:
+            print("LOADING BEST SOLUTION FROM FILE TO COMPARE WITH ACO")
+            params_from_cached_filpe = list(map(float, f.read().strip().split(",")))
+            
+    params_calculated : List[float] = swarm_algorithm(baseSystem, trainX, trainY)
+    
+    if params_from_cached_filpe is not None:
+        applyParametersToSystem(optimizedSystem, params_calculated)
+        results_for_calculated = np.sum((trainY - evaluateCustomSystem(Fuzzy.ControlSystemSimulation(optimizedSystem), trainX))**2)
+        
+        applyParametersToSystem(optimizedSystem, params_from_cached_filpe)
+        results_for_cached = np.sum((trainY - evaluateCustomSystem(Fuzzy.ControlSystemSimulation(optimizedSystem), trainX))**2)
+        
+        better_params : List[float] = params_calculated if results_for_calculated < results_for_cached else params_from_cached_filpe
+    else:
+        better_params = params_calculated
+        
+    optimizedSystem = applyParametersToSystem(baseSystem, better_params)
+    if os.path.exists("best_solution.txt"):
+        os.remove("best_solution.txt")
+    with open("best_solution.txt", "w") as f:
+        f.write(",".join(map(str, better_params)))
+        
     return optimizedSystem
 
 class Fuzzy:
@@ -44,7 +75,8 @@ class Fuzzy:
 
         @staticmethod
         def evaluateMfScalar(mf, x):
-            if isinstance(mf, Fuzzy.Trimf):
+            # OMIJAMY CYRKULARNY IMPORT: Zamiast isinstance(mf, Fuzzy.Trimf)
+            if hasattr(mf, 'abc'):
                 a, b, c = mf.abc
                 if x < a or x > c:
                     return 0.0
@@ -85,19 +117,20 @@ class Fuzzy:
 
     @staticmethod
     def evaluateCondition(condition, inputs):
-        if isinstance(condition, Fuzzy.FuzzyTerm):
-            varName = condition.variable.name
-            label = condition.label
-            x = inputs.get(varName, 0.0)
-            mf = condition.variable.terms[label]
-            return Fuzzy.Trimf.evaluateMfScalar(mf, x)
-        elif isinstance(condition, Fuzzy.RuleCondition):
+        # OMIJAMY CYRKULARNY IMPORT za pomocą duck-typing (hasattr)
+        if hasattr(condition, 'operator'):
             leftVal = Fuzzy.evaluateCondition(condition.left, inputs)
             rightVal = Fuzzy.evaluateCondition(condition.right, inputs)
             if condition.operator == "AND":
                 return min(leftVal, rightVal)
             elif condition.operator == "OR":
                 return max(leftVal, rightVal)
+        elif hasattr(condition, 'variable'):
+            varName = condition.variable.name
+            label = condition.label
+            x = inputs.get(varName, 0.0)
+            mf = condition.variable.terms[label]
+            return Fuzzy.Trimf.evaluateMfScalar(mf, x)
         return 0.0
 
     class Antecedent:
@@ -201,11 +234,12 @@ def getUniqueVariables(system):
     consequents = {}
 
     def collectVariables(condition):
-        if isinstance(condition, Fuzzy.FuzzyTerm):
-            antecedents[condition.variable.name] = condition.variable
-        elif isinstance(condition, Fuzzy.RuleCondition):
+        # OMIJAMY CYRKULARNY IMPORT
+        if hasattr(condition, 'operator'):
             collectVariables(condition.left)
             collectVariables(condition.right)
+        elif hasattr(condition, 'variable'):
+            antecedents[condition.variable.name] = condition.variable
 
     for rule in system.rules:
         collectVariables(rule.antecedentCondition)
@@ -221,6 +255,7 @@ def applyParametersToSystem(system, parameterVector):
             abc = sorted(parameterVector[idx : idx + 3])
             var.terms[label] = Fuzzy.Trimf.trimf(var.universe, abc)
             idx += 3
+    return system
 
 def pythonGenfis(trainX, trainY, numMfs=3):
     numFeatures = trainX.shape[1]
@@ -302,14 +337,16 @@ def pythonGenfis(trainX, trainY, numMfs=3):
 def loadSolarFlareData():
     url = "https://archive.ics.uci.edu/ml/machine-learning-databases/solar-flare/flare.data2"
     try:
-        df = pd.read_csv(url, sep=" ", skiprows=1, header=None)
+        df = pd.read_csv(url, sep=r"\s+", skiprows=1, header=None)
+        df = df.dropna()
         for col in [0, 1, 2]:
             df[col] = df[col].astype("category").cat.codes
         data = df.values.astype(float)
         X = data[:, :10]
         y = data[:, 10]
         return X, y
-    except Exception:
+    except Exception as e:
+        print(f"ERROR WITH LOADING DATA: {e}, USING RANDOM DATA INSTEAD")
         np.random.seed(42)
         X = np.random.randint(1, 4, size=(200, 10)).astype(float)
         y = np.random.randint(0, 5, size=(200,)).astype(float)
@@ -339,68 +376,69 @@ def evaluateSkfuzzySystem(simulation, XData):
 def calculateMse(yTrue, yPred):
     return np.mean((yTrue - yPred) ** 2)
 
-X, y = loadSolarFlareData()
+if __name__ == "__main__":
+    X, y = loadSolarFlareData()
 
-halfIndex = len(X) // 2
-trainX, testX = X[:halfIndex], X[halfIndex:]
-trainY, testY = y[:halfIndex], y[halfIndex:]
+    halfIndex = len(X) // 2
+    trainX, testX = X[:halfIndex], X[halfIndex:]
+    trainY, testY = y[:halfIndex], y[halfIndex:]
 
-evolutionUniverse = np.linspace(1, 3, 100)
-prevActivityUniverse = np.linspace(1, 3, 100)
-flaresUniverse = np.linspace(0, 10, 100)
+    evolutionUniverse = np.linspace(1, 3, 100)
+    prevActivityUniverse = np.linspace(1, 3, 100)
+    flaresUniverse = np.linspace(0, 10, 100)
 
-evolution = Fuzzy.Antecedent(evolutionUniverse, "evolution")
-prevActivity = Fuzzy.Antecedent(prevActivityUniverse, "prevActivity")
-cClassFlares = Fuzzy.Consequent(flaresUniverse, "cClassFlares")
+    evolution = Fuzzy.Antecedent(evolutionUniverse, "evolution")
+    prevActivity = Fuzzy.Antecedent(prevActivityUniverse, "prevActivity")
+    cClassFlares = Fuzzy.Consequent(flaresUniverse, "cClassFlares")
 
-evolution["decay"] = Fuzzy.Trimf.trimf(evolutionUniverse, [1, 1, 2])
-evolution["noGrowth"] = Fuzzy.Trimf.trimf(evolutionUniverse, [1, 2, 3])
-evolution["growth"] = Fuzzy.Trimf.trimf(evolutionUniverse, [2, 3, 3])
+    evolution["decay"] = Fuzzy.Trimf.trimf(evolutionUniverse, [1, 1, 2])
+    evolution["noGrowth"] = Fuzzy.Trimf.trimf(evolutionUniverse, [1, 2, 3])
+    evolution["growth"] = Fuzzy.Trimf.trimf(evolutionUniverse, [2, 3, 3])
 
-prevActivity["low"] = Fuzzy.Trimf.trimf(prevActivityUniverse, [1, 1, 2])
-prevActivity["medium"] = Fuzzy.Trimf.trimf(prevActivityUniverse, [1, 2, 3])
-prevActivity["high"] = Fuzzy.Trimf.trimf(prevActivityUniverse, [2, 3, 3])
+    prevActivity["low"] = Fuzzy.Trimf.trimf(prevActivityUniverse, [1, 1, 2])
+    prevActivity["medium"] = Fuzzy.Trimf.trimf(prevActivityUniverse, [1, 2, 3])
+    prevActivity["high"] = Fuzzy.Trimf.trimf(prevActivityUniverse, [2, 3, 3])
 
-cClassFlares["none"] = Fuzzy.Trimf.trimf(flaresUniverse, [0, 0, 2])
-cClassFlares["few"] = Fuzzy.Trimf.trimf(flaresUniverse, [1, 3, 5])
-cClassFlares["many"] = Fuzzy.Trimf.trimf(flaresUniverse, [4, 10, 10])
+    cClassFlares["none"] = Fuzzy.Trimf.trimf(flaresUniverse, [0, 0, 2])
+    cClassFlares["few"] = Fuzzy.Trimf.trimf(flaresUniverse, [1, 3, 5])
+    cClassFlares["many"] = Fuzzy.Trimf.trimf(flaresUniverse, [4, 10, 10])
 
-gridRules = generateGridPartitioningRules([evolution, prevActivity], cClassFlares)
-customSystem = Fuzzy.ControlSystem(gridRules)
+    gridRules = generateGridPartitioningRules([evolution, prevActivity], cClassFlares)
+    customSystem = Fuzzy.ControlSystem(gridRules)
 
-tunedSystem = antColonyOptimization(trainX, trainY, customSystem)
+    tunedSystem = swarmColonyOptimization(trainX, trainY, customSystem, True)
 
-customSimulation = Fuzzy.ControlSystemSimulation(customSystem)
-customSimulationACO = Fuzzy.ControlSystemSimulation(tunedSystem)
-genfisSimulation = pythonGenfis(trainX, trainY, numMfs=3)
+    customSimulation = Fuzzy.ControlSystemSimulation(customSystem)
+    customSimulationACO = Fuzzy.ControlSystemSimulation(tunedSystem)
+    genfisSimulation = pythonGenfis(trainX, trainY, numMfs=3)
 
-customPreds = evaluateCustomSystem(customSimulation, testX)
-customPredsACO = evaluateCustomSystem(customSimulationACO, testX)
-genfisPreds = evaluateSkfuzzySystem(genfisSimulation, testX)
+    customPreds = evaluateCustomSystem(customSimulation, testX)
+    customPredsACO = evaluateCustomSystem(customSimulationACO, testX)
+    genfisPreds = evaluateSkfuzzySystem(genfisSimulation, testX)
 
-customMse = calculateMse(testY, customPreds)
-customMseACO = calculateMse(testY, customPredsACO)
-genfisMse = calculateMse(testY, genfisPreds)
+    customMse = calculateMse(testY, customPreds)
+    customMseACO = calculateMse(testY, customPredsACO)
+    genfisMse = calculateMse(testY, genfisPreds)
 
-# MSE
-print(f"MSE Custom System (Przed ACO): {customMse:.4f}")
-print(f"MSE Custom System (Po ACO):    {customMseACO:.4f}")
-print(f"MSE genfis System:             {genfisMse:.4f}")
+    # MSE
+    print(f"MSE Custom System (Przed ACO): {customMse:.4f}")
+    print(f"MSE Custom System (Po ACO):    {customMseACO:.4f}")
+    print(f"MSE genfis System:             {genfisMse:.4f}")
 
-# R2
-customR2 = r2_score(testY, customPreds)
-customR2ACO = r2_score(testY, customPredsACO)
-genfisR2 = r2_score(testY, genfisPreds)
+    # R2
+    customR2 = r2_score(testY, customPreds)
+    customR2ACO = r2_score(testY, customPredsACO)
+    genfisR2 = r2_score(testY, genfisPreds)
 
-print(f"\nR2 Custom System (Przed ACO):  {customR2:.4f}")
-print(f"R2 Custom System (Po ACO):     {customR2ACO:.4f}")
-print(f"R2 genfis System:              {genfisR2:.4f}")
+    print(f"\nR2 Custom System (Przed ACO):  {customR2:.4f}")
+    print(f"R2 Custom System (Po ACO):     {customR2ACO:.4f}")
+    print(f"R2 genfis System:              {genfisR2:.4f}")
 
-# MAE
-customMae = mean_absolute_error(testY, customPreds)
-customMaeACO = mean_absolute_error(testY, customPredsACO)
-genfisMae = mean_absolute_error(testY, genfisPreds)
+    # MAE
+    customMae = mean_absolute_error(testY, customPreds)
+    customMaeACO = mean_absolute_error(testY, customPredsACO)
+    genfisMae = mean_absolute_error(testY, genfisPreds)
 
-print(f"\nMAE Custom System (Przed ACO): {customMae:.4f}")
-print(f"MAE Custom System (Po ACO):    {customMaeACO:.4f}")
-print(f"MAE genfis System:             {genfisMae:.4f}")
+    print(f"\nMAE Custom System (Przed ACO): {customMae:.4f}")
+    print(f"MAE Custom System (Po ACO):    {customMaeACO:.4f}")
+    print(f"MAE genfis System:             {genfisMae:.4f}")
